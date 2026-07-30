@@ -1,8 +1,7 @@
 import { Router, Request, Response } from "express";
-import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import RateLimiterService from "./middleware/rateLimiter.service";
 import * as os from "os";
-import * as crypto from "crypto";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { container } from "tsyringe";
 import AppDataSource from "../config/Datasource";
@@ -11,113 +10,44 @@ import UserService from "../Auth/user.service";
 import { stellarWebhookService } from "./webhook.service";
 import { platformWebhookService } from "./platformWebhook.service";
 import { SponsorshipTransactionBuilder } from "../../packages/sdk/src/sponsorship";
-import {
-  transactionHistoryService,
-  type TransactionQueryParams,
-  type TransactionType,
-} from "./transaction.service";
 import logger from "../config/logger";
 import authRoutes from "../Auth/auth.routes";
 import userPreferencesRoutes from "../Auth/userPreferences.routes";
+import botIdentityRoutes from "../Auth/botIdentity.routes";
 import dataExportRoutes from "../services/dataExport.routes";
 import contractMetadataRoutes from "../services/contracts/contractMetadata.routes";
 import horizonProxyRoutes from "./horizonProxy.routes";
 import auditLogRoutes from "../AuditLog/auditLog.routes";
 import adminAgentRoutes from "../Agents/admin/adminAgent.routes";
+import governanceRoutes from "../Agents/admin/governance.routes";
 import experimentRoutes from "../Agents/admin/experiment.routes";
 import simulationRoutes from "../Agents/admin/simulation.routes";
+import workflowRoutes from "../Agents/admin/workflow.routes";
 import { stellarLiquidityTool } from "../Agents/tools/stellarLiquidityTool";
-import { authenticateToken } from "../Auth/auth.middleware";
-import {
-  requireAdmin,
-  requireOwnerOrElevated,
-} from "./middleware/rbac.middleware";
 import { auditLogService } from "../AuditLog/auditLog.service";
 import { AuditAction, AuditSeverity } from "../AuditLog/auditLog.entity";
-import contractRegistryRoutes from "../ContractRegistry/contractRegistry.routes";
+import kycRoutes from "../services/kyc/kyc.routes";
 import { getSocketManager } from "./socketManager";
 import { BotSessionService } from "../Bot/botSession.service";
 import { BotSessionType, BotPlatform } from "../Bot/botSession.entity";
 import { operatorReportingService } from "../services/operatorReporting.service";
 
 const router = Router();
-
 router.use(helmet());
 
-// --- WEBHOOK HMAC VERIFICATION ---
-
-/**
- * Verify HMAC-SHA256 signature on incoming webhook requests.
- * Expects the signature in the `x-webhook-signature` header as `sha256=<hex>`.
- * Set WEBHOOK_SECRET in your environment to enable enforcement.
- */
-function verifyWebhookSignature(
-  req: Request,
-  res: Response,
-  next: () => void
-): void {
-  const secret = process.env.WEBHOOK_SECRET;
-  if (!secret) {
-    // If no secret is configured, skip verification (dev/test environments).
-    // In production, WEBHOOK_SECRET must be set.
-    logger.warn(
-      "WEBHOOK_SECRET not configured — skipping webhook signature verification"
-    );
-    next();
-    return;
-  }
-
-  const signature = req.headers["x-webhook-signature"] as string | undefined;
-  if (!signature) {
-    res
-      .status(401)
-      .json({ success: false, message: "Missing webhook signature" });
-    return;
-  }
-
-  const rawBody = JSON.stringify(req.body);
-  const expected =
-    "sha256=" +
-    crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-
-  const sigBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
-
-  if (
-    sigBuffer.length !== expectedBuffer.length ||
-    !crypto.timingSafeEqual(sigBuffer, expectedBuffer)
-  ) {
-    logger.warn("Webhook signature mismatch", { receivedSignature: signature });
-    res
-      .status(401)
-      .json({ success: false, message: "Invalid webhook signature" });
-    return;
-  }
-
-  next();
-}
-
-// --- RATE LIMITING STRATEGIES ---
-
-// AC: 100 req/min per IP for public/general routes
-const generalLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  limit: 100,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-  message: { success: false, message: "Too many requests. Please slow down." },
-});
-
-// Apply general limiter to all routes by default
+// Redis-backed general rate limiter (shared across all instances)
+const generalLimiter = RateLimiterService.createGeneralLimiter();
 router.use(generalLimiter);
 
-// --- ROUTES ---
-
-// Mount auth routes
+// Auth routes (includes login, logout, refresh, sessions)
 router.use("/auth", authRoutes);
+router.use("/auth", authExtraRoutes);
 
 // Mount user preferences routes
 router.use("/user/preferences", userPreferencesRoutes);
+
+// Mount bot identity routes
+router.use("/bot-identity", botIdentityRoutes);
 
 // Mount data export routes
 router.use("/export", dataExportRoutes);
@@ -125,19 +55,27 @@ router.use("/export", dataExportRoutes);
 // Mount contract metadata discovery routes
 router.use("/contracts", contractMetadataRoutes);
 
+// Mount KYC submission routes (with strict rate limiting)
+router.use("/kyc", kycRoutes);
+
 // Mount Horizon proxy routes (authenticated)
 router.use("/horizon", horizonProxyRoutes);
-// Mount audit log routes
+
+// Audit logs
 router.use("/audit", auditLogRoutes);
 
-// Mount admin agent management routes (requires admin role)
+// Admin agent routes
 router.use("/admin/agents", adminAgentRoutes);
+router.use("/admin/governance", governanceRoutes);
 
 // Mount experiment management routes (requires admin role)
 router.use("/admin/experiments", experimentRoutes);
 
 // Mount simulation routes (requires admin role)
 router.use("/admin/simulation", simulationRoutes);
+
+// Mount workflow routes (requires admin role)
+router.use("/admin/workflows", workflowRoutes);
 router.get(
   "/admin/operator-report",
   authenticateToken,
@@ -193,26 +131,29 @@ router.post("/bot/metrics", async (req: Request, res: Response) => {
     }
 
     // Map bot command to audit action
-    const commandMap: Record<string, AuditAction> = {
-      "!start": AuditAction.BOT_COMMAND_START,
-      "/start": AuditAction.BOT_COMMAND_START,
-      "!help": AuditAction.BOT_COMMAND_HELP,
-      "/help": AuditAction.BOT_COMMAND_HELP,
-      "!thread": AuditAction.BOT_COMMAND_THREAD,
-      "!sponsor": AuditAction.BOT_COMMAND_SPONSOR,
-      "!trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
-      "/trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
-      "!dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
-      "/dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
-      "!validate": AuditAction.BOT_COMMAND_VALIDATE,
-      "/validate": AuditAction.BOT_COMMAND_VALIDATE,
-      "!balance": AuditAction.BOT_COMMAND_BALANCE,
-      "/balance": AuditAction.BOT_COMMAND_BALANCE,
-      "!swap": AuditAction.BOT_COMMAND_SWAP,
-      "/swap": AuditAction.BOT_COMMAND_SWAP,
-    };
+    const auditAction = (
+      {
+        "!start": AuditAction.BOT_COMMAND_START,
+        "/start": AuditAction.BOT_COMMAND_START,
+        "!help": AuditAction.BOT_COMMAND_HELP,
+        "/help": AuditAction.BOT_COMMAND_HELP,
+        "!thread": AuditAction.BOT_COMMAND_THREAD,
+        "!sponsor": AuditAction.BOT_COMMAND_SPONSOR,
+        "!trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
+        "/trustline": AuditAction.BOT_COMMAND_TRUSTLINE,
+        "!dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
+        "/dashboard": AuditAction.BOT_COMMAND_DASHBOARD,
+        "!validate": AuditAction.BOT_COMMAND_VALIDATE,
+        "/validate": AuditAction.BOT_COMMAND_VALIDATE,
+        "!balance": AuditAction.BOT_COMMAND_BALANCE,
+        "/balance": AuditAction.BOT_COMMAND_BALANCE,
+        "!swap": AuditAction.BOT_COMMAND_SWAP,
+        "/swap": AuditAction.BOT_COMMAND_SWAP,
+      } as Record<string, AuditAction>
+    )[command];
 
-    const auditAction = commandMap[command] || AuditAction.BOT_COMMAND_START;
+    // Realtime
+    router.use("/realtime", realtimeRoutes);
 
     // Log to audit log
     await auditLogService.log({
@@ -651,214 +592,30 @@ router.post("/signup", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * @swagger
- * /api/account/{userId}/transactions:
- *   get:
- *     summary: Get paginated Stellar transaction history
- *     tags: [Transactions]
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *           format: uuid
- *         description: ID of the user
- *       - in: query
- *         name: type
- *         schema:
- *           type: string
- *           enum: [funding, deployment, swap, transfer, all]
- *         description: Filter by transaction type
- *       - in: query
- *         name: startDate
- *         schema:
- *           type: string
- *           format: date-time
- *         description: Start date filter (ISO 8601)
- *       - in: query
- *         name: endDate
- *         schema:
- *           type: string
- *           format: date-time
- *         description: End date filter (ISO 8601)
- *       - in: query
- *         name: limit
- *         schema:
- *           type: integer
- *           minimum: 1
- *           maximum: 100
- *           default: 20
- *         description: Number of transactions per page
- *       - in: query
- *         name: cursor
- *         schema:
- *           type: string
- *         description: Pagination cursor from previous response
- *     responses:
- *       200:
- *         description: Paginated transaction list
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 transactions:
- *                   type: array
- *                   items:
- *                     $ref: '#/components/schemas/TransactionHistoryItem'
- *                 pagination:
- *                   type: object
- *                   properties:
- *                     nextCursor:
- *                       type: string
- *                     prevCursor:
- *                       type: string
- *                     limit:
- *                       type: integer
- *                     total:
- *                       type: integer
- *       400:
- *         description: Invalid query parameters
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
- *       404:
- *         description: User not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
- */
-router.get(
-  "/account/:userId/transactions",
-  authenticateToken,
-  requireOwnerOrElevated("userId"),
-  async (req: Request, res: Response) => {
-    try {
-      const { userId } = req.params;
+// Liquidity
+router.post("/liquidity", async (req: Request, res: Response) => {
+  try {
+    const { assetCode, assetIssuer, depthLimit } = req.body;
+    const result = await stellarLiquidityTool.execute({
+      assetCode,
+      assetIssuer,
+      depthLimit,
+    });
+    res.json(result);
+  } catch (err) {
+    const errorMessage =
+      err instanceof Error ? err.message : "An unknown error occurred";
+    res.status(500).json({ error: errorMessage });
+  }
+});
 
-      // Ensure userId is a string
-      if (!userId || Array.isArray(userId)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid userId parameter",
-        });
-      }
-
-      // Extract and validate query parameters
-      const { type, startDate, endDate, limit, cursor } = req.query as Record<
-        string,
-        string | undefined
-      >;
-
-      // Validate type parameter
-      const validTypes = ["funding", "deployment", "swap", "transfer", "all"];
-      if (type && !validTypes.includes(type)) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid type. Must be one of: ${validTypes.join(", ")}`,
-        });
-      }
-
-      // Validate limit parameter
-      const parsedLimit = limit ? parseInt(limit, 10) : 20;
-      if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
-        return res.status(400).json({
-          success: false,
-          message: "Limit must be a number between 1 and 100",
-        });
-      }
-
-      // Validate date parameters
-      if (startDate && isNaN(Date.parse(startDate))) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Invalid startDate format. Use ISO 8601 format (e.g., 2024-01-01T00:00:00Z)",
-        });
-      }
-
-      if (endDate && isNaN(Date.parse(endDate))) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Invalid endDate format. Use ISO 8601 format (e.g., 2024-01-01T00:00:00Z)",
-        });
-      }
-
-      // Build query parameters
-      const queryParams: TransactionQueryParams = {
-        type: type as TransactionType,
-        startDate,
-        endDate,
-        limit: parsedLimit,
-        cursor,
-      };
-
-      // Fetch transaction history
-      const result = await transactionHistoryService.getTransactionHistory(
-        userId,
-        queryParams
-      );
-
-      return res.status(200).json({
-        success: true,
-        ...result,
-      });
-    } catch (error) {
-      console.error("Transaction history error:", error);
-      const message =
-        error instanceof Error ? error.message : "Internal server error";
-      const statusCode = message.includes("User not found") ? 404 : 500;
-
-      return res.status(statusCode).json({
-        success: false,
-        message,
-      });
-    }
-  },
-
-  router.post("/liquidity", async (req: Request, res: Response) => {
-    try {
-      const { assetCode, assetIssuer, depthLimit } = req.body;
-
-      const result = await stellarLiquidityTool.execute({
-        assetCode,
-        assetIssuer,
-        depthLimit,
-      });
-
-      res.json(result);
-    } catch (err) {
-      // Check if it's a standard Error object
-      const errorMessage =
-        err instanceof Error ? err.message : "An unknown error occurred";
-
-      res.status(500).json({ error: errorMessage });
-    }
-  })
-);
-
-// GET /admin/stats - Internal admin route for CPU and memory usage
+// Admin stats
 router.get(
   "/admin/stats",
-  authenticateToken,
-  requireAdmin,
+  requireAdminAuth(),
   (req: Request, res: Response) => {
     const memUsage = process.memoryUsage();
     const cpuUsage = process.cpuUsage();
-
     res.json({
       success: true,
       timestamp: new Date().toISOString(),
@@ -883,6 +640,51 @@ router.get(
         pid: process.pid,
       },
     });
+  }
+);
+
+router.get(
+  "/admin/jobs/stats",
+  authenticateToken,
+  requireAdmin,
+  async (_req: Request, res: Response) => {
+    try {
+      const stats = await jobQueueService.getQueueStats();
+      res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        stats,
+      });
+    } catch (error) {
+      logger.error("Failed to fetch job queue stats", { error });
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch job queue stats",
+      });
+    }
+  }
+);
+
+router.get(
+  "/admin/jobs/dead-letter",
+  authenticateToken,
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const limit = Math.min(Number(req.query.limit) || 25, 100);
+      const jobs = await jobQueueService.getDeadLetterJobs(limit);
+      res.json({
+        success: true,
+        count: jobs.length,
+        jobs,
+      });
+    } catch (error) {
+      logger.error("Failed to fetch dead-letter jobs", { error });
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch dead-letter jobs",
+      });
+    }
   }
 );
 
@@ -912,11 +714,6 @@ router.get(
  */
 router.get("/realtime/stats", (req: Request, res: Response) => {
   try {
-    // Dynamic import to avoid circular dependency issues
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getSocketManager: getManager } = require("./socketManager");
-    const socketManager = getManager();
-    const { getSocketManager } = require("./socketManager");
     const socketManager = getSocketManager();
 
     const stats = {
@@ -967,11 +764,6 @@ router.get("/realtime/stats", (req: Request, res: Response) => {
 router.get("/realtime/user/:userId/clients", (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    // Dynamic import to avoid circular dependency issues
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getSocketManager: getManager } = require("./socketManager");
-    const socketManager = getManager();
-    const { getSocketManager } = require("./socketManager");
     const socketManager = getSocketManager();
 
     const clients = socketManager.getUserClients(userId);
@@ -1097,5 +889,107 @@ router.post(
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// Portfolio endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/portfolio/:userId?currency=USD
+ *
+ * Returns a formatted portfolio summary for the user's Stellar account,
+ * including all asset balances and estimated net worth in the requested
+ * currency (USD | XLM | BTC, default USD).
+ */
+router.get(
+  "/portfolio/:userId",
+  authenticateToken,
+  requireOwnerOrElevated("userId"),
+  async (req: Request, res: Response) => {
+    try {
+      const { userId } = req.params;
+      const currency = (req.query.currency as string | undefined) ?? "USD";
+
+      const userRepository = AppDataSource.getRepository(User);
+      const user = await userRepository.findOne({ where: { id: userId } });
+      if (!user) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+
+      const summary = await portfolioService.getPortfolio(
+        user.address,
+        currency
+      );
+
+      await auditLogService.log({
+        userId,
+        action: AuditAction.BOT_COMMAND_PORTFOLIO,
+        severity: AuditSeverity.INFO,
+        resource: `portfolio:${userId}`,
+        metadata: { currency, address: user.address },
+        success: true,
+      });
+
+      return res.status(200).json({
+        success: true,
+        address: summary.address,
+        currency: summary.currency,
+        totalValue: summary.totalValue,
+        assets: summary.assets.map((a) => ({
+          code: a.code,
+          issuer: a.issuer,
+          balance: a.amount,
+          value: a.valueInCurrency,
+        })),
+        fetchedAt: summary.fetchedAt,
+      });
+    } catch (error) {
+      logger.error("Portfolio fetch error", {
+        error,
+        userId: req.params.userId,
+      });
+      const message =
+        error instanceof Error ? error.message : "Internal server error";
+      const statusCode =
+        message.includes("not found") || message.includes("unreachable")
+          ? 404
+          : 500;
+      return res.status(statusCode).json({ success: false, message });
+    }
+  }
+);
+
+/**
+ * GET /api/price/:assetCode?currency=USD
+ *
+ * Returns the current DEX price of an asset in the requested currency.
+ * Used by the bot's price-alert polling loop and the !portfolio command.
+ */
+router.get("/price/:assetCode", async (req: Request, res: Response) => {
+  try {
+    const { assetCode } = req.params;
+    const currency = (req.query.currency as string | undefined) ?? "USD";
+
+    const result = await portfolioService.getAssetPrice(assetCode, currency);
+
+    return res.status(200).json({
+      success: true,
+      assetCode: result.assetCode,
+      currency: result.currency,
+      price: result.price,
+    });
+  } catch (error) {
+    logger.error("Price fetch error", {
+      error,
+      assetCode: req.params.assetCode,
+    });
+    return res.status(500).json({
+      success: false,
+      message: error instanceof Error ? error.message : "Internal server error",
+    });
+  }
+});
 
 export default router;

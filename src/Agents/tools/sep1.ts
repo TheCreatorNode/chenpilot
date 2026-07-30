@@ -66,6 +66,9 @@ interface AssetMetadataPayload extends Record<string, unknown> {
   domain?: string;
 }
 
+/**
+ *
+ */
 export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
   private fetch: typeof globalThis.fetch;
 
@@ -102,11 +105,22 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
     version: "1.0.0",
   };
 
+  /**
+   *
+   */
   constructor() {
     super();
     this.fetch = globalThis.fetch.bind(globalThis);
   }
 
+  private readonly domainPattern =
+    /^(?=.{1,253}$)(?!-)(?:[a-z0-9-]{1,63}(?<!-)\.)+[a-z]{2,63}$/i;
+  private readonly assetPattern =
+    /^[A-Z0-9]{1,12}:[GABCDEF0-9]{10,56}$/i;
+
+  /**
+   *
+   */
   async execute(payload: AssetMetadataPayload): Promise<ToolResult> {
     try {
       switch (payload.operation) {
@@ -177,6 +191,14 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
         action: "sep1",
         status: "error",
         error: "Asset must be in format CODE:ISSUER (e.g., USDC:GA5...Z46)",
+      };
+    }
+
+    if (!this.assetPattern.test(asset)) {
+      return {
+        action: "sep1",
+        status: "error",
+        error: "Asset must look like CODE:ISSUER with a valid Stellar public key issuer",
       };
     }
 
@@ -252,6 +274,13 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
     }
 
     const domain = payload.domain.toLowerCase();
+    if (!this.isValidDomain(domain)) {
+      return {
+        action: "sep1",
+        status: "error",
+        error: "Domain must be a valid registrable hostname",
+      };
+    }
     const toml = await this.fetchStellarToml(domain);
 
     if (!toml) {
@@ -289,6 +318,13 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
    */
   private async listAssets(payload: AssetMetadataPayload): Promise<ToolResult> {
     const domain = (payload.domain || "stellar.org").toLowerCase();
+    if (!this.isValidDomain(domain)) {
+      return {
+        action: "sep1",
+        status: "error",
+        error: "Domain must be a valid registrable hostname",
+      };
+    }
     const toml = await this.fetchStellarToml(domain);
 
     if (!toml) {
@@ -324,6 +360,10 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
    */
   private async fetchStellarToml(domain: string): Promise<StellarToml | null> {
     try {
+      if (!this.isValidDomain(domain)) {
+        return null;
+      }
+
       // Handle potential .well-known path
       const url = domain.includes(".well-known")
         ? `https://${domain}/stellar.toml`
@@ -413,9 +453,6 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
       }
 
       switch (currentSection) {
-        case "version":
-          result.version = value;
-          break;
         case "account":
         case "accounts":
           if (!result.accouns) result.accouns = {};
@@ -475,6 +512,7 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
           break;
         default:
           if (!currentSection) {
+            if (key === "VERSION") result.version = value;
             if (key === "SIGNING_KEY") result.signingKey = value;
             if (key === "HOME_DOMAIN") result.homeDomain = value;
           }
@@ -487,6 +525,13 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
     }
 
     return result;
+  }
+
+  /**
+   *
+   */
+  private isValidDomain(domain: string): boolean {
+    return this.domainPattern.test(domain) && !domain.includes("..");
   }
 
   /**
@@ -503,6 +548,10 @@ export class Sep1Tool extends BaseTool<AssetMetadataPayload> {
 
     // For now, return a placeholder domain
     // In production, this would query Horizon API or a different service
+    if (!/^[A-Z0-9]{10,56}$/i.test(issuer)) {
+      return null;
+    }
+
     return knownIssuers[issuer] || null;
   }
 }

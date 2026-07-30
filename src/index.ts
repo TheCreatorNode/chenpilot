@@ -8,17 +8,29 @@ import { initializeSocketManager } from "./Gateway/socketManager";
 import { horizonOperationStreamerService } from "./services/horizonOperationStreamer.service";
 import { priceSpikeAlertService } from "./services/priceSpikeAlert.service";
 import { durableRecoveryService } from "./Agents/planner/DurableRecoveryService";
-import { durableOperationService } from "./Reliability/DurableOperationService";
+import { idempotencyService } from "./Reliability/IdempotencyService";
+import { adminWorkflowService } from "./Agents/admin/workflow.service";
 
 class Server {
   private server: http.Server;
   private port: number;
+  private readonly jobWorker: JobWorker;
 
   constructor() {
     this.port = config.port || 3000;
     this.server = http.createServer(app);
     // Initialize Socket.io manager
     initializeSocketManager(this.server);
+    this.jobWorker = new JobWorker(jobQueueService, {
+      workerId: `api-${process.pid}`,
+      queues: ["transactions", "side-effects"],
+      concurrency: 3,
+      leaseMs: 30000,
+      pollIntervalMs: 2500,
+    });
+    for (const handler of buildDefaultJobHandlers()) {
+      this.jobWorker.registerHandler(handler);
+    }
   }
 
   public async start(): Promise<void> {
@@ -31,6 +43,7 @@ class Server {
         logger.info("Shutting down gracefully...");
         horizonOperationStreamerService.stop();
         priceSpikeAlertService.stop();
+        await this.jobWorker.stop();
         await AppDataSource.destroy();
         this.server.close(() => {
           logger.info("Server closed");
@@ -41,12 +54,15 @@ class Server {
       await AppDataSource.initialize();
       console.log("DB connection established!");
       logger.info("Database connected successfully");
-      
+
+      // Initialize default admin workflow policies
+      await adminWorkflowService.initializeDefaultPolicies();
+
       // Recover interrupted durable executions
       await durableRecoveryService.recoverInterruptedExecutions();
 
-      // Start durable operation background processor
-      durableOperationService.startBackgroundProcessor();
+      // Start unified idempotency background processor
+      idempotencyService.startBackgroundProcessor();
 
       horizonOperationStreamerService.start();
       priceSpikeAlertService.start();

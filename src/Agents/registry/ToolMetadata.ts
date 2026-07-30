@@ -1,9 +1,5 @@
 export type ParameterType =
-  | "string"
-  | "number"
-  | "boolean"
-  | "object"
-  | "array";
+  "string" | "number" | "boolean" | "object" | "array";
 
 export interface ParameterDefinition {
   type: ParameterType;
@@ -46,6 +42,10 @@ export interface ToolResult {
   message?: string;
   data?: Record<string, unknown>;
   error?: string;
+  /** Machine-readable error category (TRANSPORT, VALIDATION, SIMULATION, POLICY, COMPATIBILITY, EXECUTION, UNKNOWN) */
+  errorCategory?: string;
+  /** Machine-readable error code for the specific failure */
+  errorCode?: string;
 }
 
 export interface ToolExecutionError extends Error {
@@ -63,5 +63,5 @@ export interface ToolRegistryEntry {
   enabled: boolean;
   registeredAt: Date;
   lastUsed?: Date;
-  governanceMetadata?: Record<string, any>;
+  governanceMetadata?: Record<string, unknown>;
 }

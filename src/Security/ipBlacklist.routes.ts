@@ -1,34 +1,17 @@
-import express, { Router, Request, Response, NextFunction } from "express";
+import express, { Router, Request, Response } from "express";
 import { ipBlacklistService } from "./ipBlacklist.service";
 import { BlacklistReason } from "./ipBlacklist.entity";
-import { authenticate } from "../Auth/auth";
+import { requireAdminAuth } from "../Gateway/middleware/adminAuth";
+import { authenticateToken } from "../Auth/auth.middleware";
 import logger from "../config/logger";
 
 const router = Router();
 
 /**
- * Admin middleware - verify user is admin
- * Can be customized based on actual role management
- */
-const isAdmin = (req: Request, res: Response, next: NextFunction) => {
-  const user = (req as any).user;
-
-  if (!user || user.role !== "admin") {
-    return res.status(403).json({
-      success: false,
-      error: "Forbidden",
-      message: "Only administrators can manage IP blacklist",
-    });
-  }
-
-  next();
-};
-
-/**
  * Check if an IP is blacklisted
  * GET /security/blacklist/check/:ip
  */
-router.get("/check/:ip", authenticate, async (req: Request, res: Response) => {
+router.get("/check/:ip", authenticateToken, async (req: Request, res: Response) => {
   try {
     const { ip } = req.params;
 
@@ -56,7 +39,7 @@ router.get("/check/:ip", authenticate, async (req: Request, res: Response) => {
  * List all blacklisted IPs
  * GET /security/blacklist?limit=50&offset=0&activeOnly=true&reason=malicious_activity
  */
-router.get("/", authenticate, isAdmin, async (req: Request, res: Response) => {
+router.get("/", requireAdminAuth(), async (req: Request, res: Response) => {
   try {
     const { limit = 50, offset = 0, activeOnly = "true", reason } = req.query;
 
@@ -89,8 +72,7 @@ router.get("/", authenticate, isAdmin, async (req: Request, res: Response) => {
  */
 router.get(
   "/stats",
-  authenticate,
-  isAdmin,
+  requireAdminAuth(),
   async (req: Request, res: Response) => {
     try {
       const stats = await ipBlacklistService.getStatistics();
@@ -114,7 +96,7 @@ router.get(
  * Add an IP to the blacklist
  * POST /security/blacklist
  */
-router.post("/", authenticate, isAdmin, async (req: Request, res: Response) => {
+router.post("/", requireAdminAuth(), async (req: Request, res: Response) => {
   try {
     const {
       ipAddress,
@@ -146,14 +128,14 @@ router.post("/", authenticate, isAdmin, async (req: Request, res: Response) => {
       reason,
       description,
       expiresAt: expiresAt ? new Date(expiresAt) : undefined,
-      addedBy: (req as any).user?.id,
+      addedBy: req.user?.id,
       metadata,
     });
 
     logger.info("IP added to blacklist via API", {
       ipAddress,
       reason,
-      addedBy: (req as any).user?.id,
+      addedBy: req.user?.id,
     });
 
     res.status(201).json({
@@ -177,8 +159,7 @@ router.post("/", authenticate, isAdmin, async (req: Request, res: Response) => {
  */
 router.post(
   "/bulk",
-  authenticate,
-  isAdmin,
+  requireAdminAuth(),
   async (req: Request, res: Response) => {
     try {
       const {
@@ -210,7 +191,7 @@ router.post(
           options: {
             reason,
             description,
-            addedBy: (req as any).user?.id,
+            addedBy: req.user?.id,
           },
         }))
       );
@@ -218,7 +199,7 @@ router.post(
       logger.info("Bulk IPs added to blacklist via API", {
         count: entries.length,
         reason,
-        addedBy: (req as any).user?.id,
+        addedBy: req.user?.id,
       });
 
       res.status(201).json({
@@ -243,8 +224,7 @@ router.post(
  */
 router.delete(
   "/:ip",
-  authenticate,
-  isAdmin,
+  requireAdminAuth(),
   async (req: Request, res: Response) => {
     try {
       const { ip } = req.params;
@@ -261,7 +241,7 @@ router.delete(
 
       logger.info("IP removed from blacklist via API", {
         ip,
-        removedBy: (req as any).user?.id,
+        removedBy: req.user?.id,
       });
 
       res.json({
@@ -285,15 +265,14 @@ router.delete(
  */
 router.post(
   "/cleanup",
-  authenticate,
-  isAdmin,
+  requireAdminAuth(),
   async (req: Request, res: Response) => {
     try {
       const count = await ipBlacklistService.cleanupExpiredEntries();
 
       logger.info("Cleaned up expired blacklist entries", {
         count,
-        cleanedBy: (req as any).user?.id,
+        cleanedBy: req.user?.id,
       });
 
       res.json({
@@ -313,3 +292,4 @@ router.post(
 );
 
 export default router;
+export const ipBlacklistRoutes = router;
